@@ -93,6 +93,7 @@ G_DEFINE_DYNAMIC_TYPE_EXTENDED(
 
 static struct {
     int fd;
+    int render_fd;
     drmModeRes *base_resources;
     drmModePlaneRes *plane_resources;
 
@@ -123,6 +124,7 @@ static struct {
     bool mode_set;
 } drm_data = {
     .fd = -1,
+    .render_fd = -1,
     .base_resources = NULL,
     .plane_resources = NULL,
     .connector =
@@ -317,6 +319,12 @@ clear_drm (void)
         close (drm_data.fd);
         drm_data.fd = -1;
     }
+
+    if (drm_data.render_fd != -1) {
+        close (drm_data.render_fd);
+        drm_data.render_fd = -1;
+    }
+
 }
 
 static gboolean
@@ -397,6 +405,23 @@ init_drm(void)
 
         close (drm_data.fd);
         drm_data.fd = -1;
+    }
+
+    for (int i = 0; i < num_devices; ++i) {
+        drmDevice* device = devices[i];
+        if (!(device->available_nodes & (1 << DRM_NODE_RENDER)))
+            continue;
+
+        if (g_getenv("RENDER_FD") == NULL)
+            break;
+
+        drm_data.render_fd = open (device->nodes[DRM_NODE_RENDER], O_RDWR);
+        if (drm_data.render_fd < 0)
+            continue;
+
+        g_debug ("init_drm: using device %p, DRM_NODE_RENDER %s",
+                 device, device->nodes[DRM_NODE_RENDER]);
+        break;
     }
 
     drmFreeDevices(devices, num_devices);
@@ -659,9 +684,12 @@ clear_gbm (void)
 static gboolean
 init_gbm (void)
 {
-    gbm_data.device = gbm_create_device (drm_data.fd);
+    gbm_data.device = gbm_create_device (drm_data.render_fd != -1 ? drm_data.render_fd : drm_data.fd);
     if (!gbm_data.device)
         return FALSE;
+
+    g_debug("init_gbm: backend name %s - %p",
+            gbm_device_get_backend_name(gbm_data.device), gbm_data.device);
 
     return TRUE;
 }
@@ -682,20 +710,29 @@ init_egl (void)
     if (!s_eglGetPlatformDisplay)
         s_eglGetPlatformDisplay = (PFNEGLGETPLATFORMDISPLAYEXTPROC) load_egl_proc_address ("eglGetPlatformDisplayEXT");
 
-    if (s_eglGetPlatformDisplay)
+    if (g_getenv("EGL_DEFAULT_DISPLAY") != NULL) {
+        egl_data.display = eglGetDisplay(EGL_DEFAULT_DISPLAY);
+        g_debug("init_egl: EGL_DEFAULT_DISPLAY %p", egl_data.display);
+    } else if (s_eglGetPlatformDisplay && g_getenv("EGL_DISPLAY_EXT") != NULL) {
         egl_data.display = s_eglGetPlatformDisplay (EGL_PLATFORM_GBM_KHR, gbm_data.device, NULL);
-    else
+        g_debug("init_egl: s_eglGetPlatformDisplay %p", egl_data.display);
+    } else {
         egl_data.display = eglGetDisplay((EGLNativeDisplayType) gbm_data.device);
+        g_debug("init_egl: eglGetDisplay %p", egl_data.display);
+    }
 
     if (!egl_data.display) {
         clear_egl ();
         return FALSE;
     }
 
+    g_debug("init_egl: eglInitialize");
     if (!eglInitialize (egl_data.display, NULL, NULL)) {
+        g_debug("init_egl: eglInitialize fail");
         clear_egl ();
         return FALSE;
     }
+    g_debug("init_egl: eglInitialize success");
 
     return TRUE;
 }
